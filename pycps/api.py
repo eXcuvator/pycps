@@ -65,8 +65,10 @@ def download(overwrite_cached=False, config_file = False):
 # Parsing
 #-----------------------------------------------------------------------------
 
-def parse():
-    settings = par.read_settings(str(_HERE_ / 'settings.json'))
+def parse(config_file = False):
+    if config_file == False:
+        config_file = str(_HERE_ / 'settings.json')
+    settings = par.read_settings(config_file)
     dd_path = Path(settings['dd_path'])
     dds = [x for x in dd_path.iterdir() if x.suffix in ('.ddf', '.asc')]
     monthly_path = Path(settings['monthly_path'])
