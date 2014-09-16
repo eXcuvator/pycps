@@ -9,6 +9,7 @@ from http://www.nber.org/data/cps_basic.html
 TODO: March Supplements
 """
 import re
+import logging
 import datetime
 from pathlib import Path
 from itertools import chain
@@ -20,6 +21,7 @@ import requests
 from lxml import html
 from pandas.core.common import is_list_like
 
+logger = logging.getLogger(__name__)
 
 def all_monthly_files(site='http://www.nber.org/data/cps_basic.html',
                       kind='data'):
@@ -33,10 +35,11 @@ def all_monthly_files(site='http://www.nber.org/data/cps_basic.html',
     kind: {'data', 'dictionary'}
         whether to get the actual data file or the data-dictionary
     """
+    logger.info("Fetching monthly files from {}".format(site))
     if kind == 'data':
         regex = re.compile(r'cpsb\d{4}.Z|\w{3}\d{2}pub.zip')
     elif kind == 'dictionary':
-        regex = re.compile(r'[\w\d]*\.(ddf|asc)')
+        regex = re.compile(r'[\w\d]*\.(ddf|asc)|January_2013_Record_Layout.(txt)')
     else:
         raise ValueError("Kind must be one of `data`, or `dictionary`. "
                          "Got {} instead.".format(kind))
@@ -85,6 +88,9 @@ def rename_cps_monthly(cpsname):
             dt = datetime.datetime.strptime(fname, 'cps%y')
         else:
             raise ValueError
+    elif ext == 'txt':
+        # expecting January_2013_Record_Layout.txt
+        dt = datetime.datetime.strptime(fname.split('_')[1], '%Y')
     else:
         raise ValueError
     return dt.strftime('cpsm%Y-%m') + '.' + ext
@@ -113,7 +119,7 @@ def filter_monthly(files, months=None, kind='data'):
     if kind == 'dictionary':
         filtered = filter_dds(files, months=months)
     elif kind == 'data':
-        filtered = filter_months(files, months=months)
+        filtered = filter_monthly_files(files, months=months)
     else:
         raise ValueError("kind must be 'data' or 'dictionary'.")
     return filtered
@@ -204,8 +210,10 @@ def download_month(month, datapath):
     if not datapath.exists():
         datapath.mkdir(parents=True)
 
+    logger.info("Fetching monthly file from {}".format(base + month))
     r = requests.get(base + month, stream=True)
     outpath = datapath / myname
+    logger.info("Writing {}".format(outpath))
     with outpath.open('wb') as f:
         for chunk in r.iter_content(chunk_size=1024):
             f.write(chunk)

@@ -5,8 +5,9 @@ import os
 import re
 import json
 import zipfile
+import logging
 from pathlib import Path
-from functools import partial
+from functools import partial, wraps
 from itertools import dropwhile
 from collections import OrderedDict
 from contextlib import contextmanager
@@ -15,15 +16,17 @@ import arrow
 import numpy as np
 import pandas as pd
 
-from pycps.compat import StringIO
+from pycps.compat import StringIO, str_types
 
 #-----------------------------------------------------------------------------
 # Globals
+logger = logging.getLogger(__name__)
 
 _data_path = Path(__file__).parent / 'data.json'
 with _data_path.open() as f:
-    DD_TO_MONTH = json.load(f)['dd_to_month']
-
+    d = json.load(f)
+    DD_TO_MONTH = d['dd_to_month']
+    REPLACER_D = d['col_rename_by_dd']
 
 #-----------------------------------------------------------------------------
 # Settings
@@ -61,6 +64,8 @@ def read_settings(filepath):
     settings: dict
 
     """
+    logger.info("Reading settings from {}".format(filepath))
+
     with _open_file_or_stringio(filepath) as f:
         f = _skip_module_docstring(f)
         f = ''.join(list(f))  # TODO: could be lazier
@@ -68,7 +73,7 @@ def read_settings(filepath):
         f = json.loads(f)
 
     # need to sort so that we can substitue down the line
-    paths = sorted(filter(lambda x: isinstance(x[1], str), f.items()),
+    paths = sorted(filter(lambda x: isinstance(x[1], str_types), f.items()),
                    key=lambda x: x.count('/'))
     paths = OrderedDict(paths)
 
@@ -89,6 +94,7 @@ def read_settings(filepath):
     f.update(paths)
     return f
 
+
 def _sub_path(v, f):
     pat = r'\{(.*)\}'
     m = re.match(pat, v)
@@ -99,6 +105,7 @@ def _sub_path(v, f):
 
 #-----------------------------------------------------------------------------
 # Data Dictionaries
+
 
 class DDParser:
     """
@@ -136,7 +143,7 @@ class DDParser:
                   "cpsm1998-01": 1, "cpsm2003-01": 2, "cpsm2004-05": 2,
                   "cpsm2005-08": 2, "cpsm2007-01": 2, "cpsm2009-01": 2,
                   "cpsm2010-01": 2, "cpsm2012-05": 2, "cpsm2013-01": 2
-              }
+                  }
 
         self.store_path = settings['dd_store']
         self.store_name = infile.stem
@@ -150,10 +157,14 @@ class DDParser:
             self.encoding = 'latin_1'
         else:
             self.encoding = None
+        self.col_rename = REPLACER_D[self.store_name]
 
     def run(self):
         # make this as streamlike as possible.
         # TODO: break out formatting
+
+        logger.info("Starting DDParser on {}".format(self.infile))
+
         with self.infile.open(encoding=self.encoding) as f:
             # get all header lines
             lines = (self.regex.match(line) for line in f)
@@ -165,7 +176,20 @@ class DDParser:
 
         # ensure consistency across lines
         df = self.make_consistent(formatted)
-        assert self.is_consistent(df)
+        df = self.regularize_ids(df, replacer=self.col_rename)
+        try:
+            assert self.is_consistent(df)
+            logger.info("Passed consistency check for {}".format(self.infile))
+        except AssertionError:
+            logger.error("Failed consistency check for {}".format(self.infile))
+            if not check_width(df).all():
+                logger.error("Bad widths: {}".format(df[~check_width(df)]))
+            else:
+                bad = pd.concat([df.shift()[~check_steps(df)],
+                                 df[~check_steps(df)]], axis=1,
+                                keys=['low', 'high'])
+                logger.error("Bad steps: {}".format(bad))
+            raise ValueError("Data Dictionary is not consistent")
         return df
 
     @staticmethod
@@ -179,9 +203,6 @@ class DDParser:
         1. width == (end - start) + 1
         2. start_1 == end_0 + 1
         """
-        check_width = lambda df: df['length'] == df['end'] - df['start'] + 1
-        check_steps = lambda df: df.start - df.end.shift(1).fillna(0) - 1 == 0
-
         return check_width(formatted).all() and check_steps(formatted).all()
 
     @staticmethod
@@ -201,14 +222,17 @@ class DDParser:
     @staticmethod
     def make_regex(style=None):
         """
-        Regex factory to match. Each dd has a style (just an id for that regex).
+        Regex factory to match. Each dd has a style (just an id for that regex)
         Some dds share styles.
         The default style is the most recent.
         """
-        # As new styles are added the current default should be moved into the dict.
+        # As new styles are added the current default should be moved into the
+        # dict.
         # TODO: this smells terrible
-        default = re.compile(r'[\x0c]{0,1}(\w+)\*?[\s\t]*(\d{1,2})[\s\t]*(.*?)[\s\t]*\(*(\d+)\s*-\s*(\d+)\)*\s*$')
-        d = {0: re.compile(r'(\w{1,2}[\$\-%]\w*|PADDING)\s*CHARACTER\*(\d{3})\s*\.{0,1}\s*\((\d*):(\d*)\).*'),
+        default = re.compile(r'[\x0c]{0,1}(\w+)\*?[\s\t]*(\d{1,2})[\s\t]*(.*?)'
+                             '[\s\t]*\(*(\d+)\s*-\s*(\d+)\)*\s*$')
+        d = {0: re.compile(r'(\w{1,2}[\$\-%]\w*|PADDING)\s*CHARACTER\*(\d{3})'
+                           '\s*\.{0,1}\s*\((\d*):(\d*)\).*'),
              1: re.compile(r'D (\w+) \s* (\d{1,2}) \s* (\d*)'),
              2: default}
         return d.get(style, default)
@@ -251,6 +275,8 @@ class DDParser:
         None: IO
 
         """
+        logger.info("Writing {} to {}".format(self.store_name,
+                                              self.store_path))
         df.to_hdf(self.store_path, key=self.store_name, format='f')
 
     @staticmethod
@@ -263,36 +289,49 @@ class DDParser:
             id_ = id_.replace(bad_char, good_char)
         return id_
 
-
     def make_consistent(self, formatted):
         """
         redo
         """
+        def _insert_unknown(df, start, end):
+            """
+            For DRYness.
+            start : where the unknown field starts (last known end + 1)
+            end : where the unknown field ends (next known start - 1)
+            """
+            length = end - start + 1
+            good_low = df.loc[:df[df.end == (start - 1)].index[0]]
+            good_high = df.loc[df[df.start == (end + 1)].index[0]:]
+            fixed = pd.concat([good_low,
+                               pd.DataFrame([['unknown', length, start, end]],
+                                            columns=['id', 'length', 'start',
+                                                     'end']),
+                               good_high],
+                              ignore_index=True)
+            return fixed
+
+        # @log_transform(self.__class__)
         def m1998_01_149_unknown(formatted):
-            fixed = pd.concat([formatted.loc[:60],
-                               pd.DataFrame([['unknown', 2, 149, 150]],
-                                            columns=['id', 'length', 'start', 'end']),
-                               formatted.loc[61:]],
-                              ignore_index=True)
-            return fixed
+            return _insert_unknown(formatted, 149, 150)
 
+        # @log_transform(self.__class__)
         def m1998_01_535_unknown(formatted):
-            fixed = pd.concat([formatted.loc[:240],
-                               pd.DataFrame([['unknown', 4, 536, 539]],
-                                            columns=['id', 'length', 'start', 'end']),
-                               formatted.loc[241:]],
-                              ignore_index=True)
-            return fixed
+            return _insert_unknown(formatted, 536, 539)
 
+        # @log_transform(self.__class__)
         def m1998_01_556_unknown(formatted):
-            fixed = pd.concat([formatted.loc[:244],
-                               pd.DataFrame([['unknown', 4, 536, 539]],
-                                            columns=['id', 'length', 'start', 'end']),
-                               formatted.loc[245:]],
-                              ignore_index=True)
-            return fixed
+            return _insert_unknown(formatted, 557, 558)
 
+        def m1998_01_632_unknown(formatted):
+            return _insert_unknown(formatted, 633, 638)
 
+        def m1998_01_680_unknown(formatted):
+            return _insert_unknown(formatted, 681, 682)
+
+        def m1998_01_786_unknown(formatted):
+            return _insert_unknown(formatted, 787, 790)
+
+        # @log_transform(self.__class__)
         def m2004_05_filler_411(formatted):
             """
             See below
@@ -301,6 +340,7 @@ class DDParser:
             fixed.loc[185] = ('FILLER', 2, 410, 411)
             return fixed
 
+        # @log_transform(self.__class__)
         def m2004_08_filler_411(formatted):
             """
             See below
@@ -309,15 +349,16 @@ class DDParser:
             fixed.loc[185] = ('FILLER', 2, 410, 411)
             return fixed
 
+        # @log_transform(self.__class__)
         def m2005_08_filler_411(formatted):
             """
             Mistake in Data Dictionary:
 
-            FILLER          2                                          (411 - 412)
+            FILLER          2                                      (411 - 412)
 
             should be:
 
-            FILLER          2                                          (410 - 411)
+            FILLER          2                                      (410 - 411)
 
             Everything else looks ok.
             """
@@ -325,6 +366,7 @@ class DDParser:
             fixed.loc[185] = ('FILLER', 2, 410, 411)
             return fixed
 
+        # @log_transform(self.__class__)
         def generate_cpsm200511(formatted):
             """
             The CPS added new questions in November 2005 (Katrina related).
@@ -332,35 +374,45 @@ class DDParser:
 
             This function:
 
-                0. ignores the end at col 886 and makes formatted throug the end of the file
+                0. ignores the end at col 886 and makes formatted throug the
+                   end of the file
                 1. writes out that *new* formatted as cpsm2005-11 to HDF?
-                2. Truncates the current `formatted` at col 886 (correct for 2005-08 thru 2005-10)
+                2. Truncates the current `formatted` at col 886 (correct fo
+                   2005-08 thru 2005-10)
                 3. return to the original control flow.
 
             Good luck trying to test this.
             """
             # generate and write cpsm2005-11
             new = formatted.drop(376).reset_index()
+            key = 'cpsm2005-11'
+            # The debt is real
+            new = self.regularize_ids(new, replacer=REPLACER_D[key])
             assert self.is_consistent(new)
 
             # write this out.
-            new.to_hdf(self.store_path, key='cpsm2005-11', format='f')
+            new.to_hdf(self.store_path, key=key, format='f')
 
             # fix original (for aug. thru oct. 2005)
             return formatted.loc[:376]
 
+        # @log_transform(self.__class__)
         def m2009_01_filler_399(formatted):
-            assert formatted.loc[399].values.tolist() == ['FILLER', 45, 932, 950]
+            assert formatted.loc[399].values.tolist() == ['FILLER', 45, 932,
+                                                          950]
             fixed = formatted.copy()
             fixed.loc[399] = ('FILLER', 19, 932, 950)
             return fixed
 
-        dispatch = {'cpsm1998-01': [m1998_01_535_unknown, m1998_01_149_unknown],
+        dispatch = {'cpsm1998-01': [m1998_01_149_unknown, m1998_01_535_unknown,
+                                    m1998_01_556_unknown, m1998_01_632_unknown,
+                                    m1998_01_680_unknown, m1998_01_786_unknown],
                     'cpsm2004-05': [m2004_05_filler_411],
                     'cpsm2005-08': [m2005_08_filler_411, generate_cpsm200511],
                     'cpsm2009-01': [m2009_01_filler_399]
                    }
         for func in dispatch.get(self.store_name, []):
+            logger.info("Applying {} to {}".format(func, self.store_name))
             formatted = func(formatted)
 
         return formatted
@@ -427,6 +479,7 @@ def read_monthly(infile, dd):
 
     """
     widths = dd.length.tolist()
+    logger.info("Reading monthly {}".format(infile))
 
     if isinstance(infile, StringIO):
         df = pd.read_fwf(infile, widths=widths, names=dd.id.values)
@@ -458,12 +511,13 @@ def write_monthly(df, storepath, key):
     None: IO
 
     """
+    logger.info("Writing {} to {}".format(key, storepath))
     df.to_hdf(storepath, key=key, format='f')
 
 
 def fixup_by_dd(df, dd_name):
 
-
+    @log_transform(dd_name)
     def compute_hrhhid2(df):
         """
         pre may2004 need to fill out the ids by creating HRHHID2 manually:
@@ -487,8 +541,13 @@ def fixup_by_dd(df, dd_name):
 
         hrsample = df['HRSAMPLE'].str.extract(r'(\d+)')
         hrsersuf = df['HRSERSUF'].astype(str)
-        # TODO: log drops
-        huhhnum = df['HUHHNUM'].replace(-1, np.nan).dropna().astype(str)
+
+        huhhnum = df['HUHHNUM'].replace(-1, np.nan)
+
+        to_drop = df[pd.isnull(huhhnum)]
+        if to_drop.shape[1] > 0:
+            logger.info("Dropping {}".format(to_drop.index))
+        huhhnum = huhhnum.dropna().astype(str)
 
         sersuf_d = {a: str(ord(a.lower()) - 96).zfill(2) for a in hrsersuf.unique()
                     if a in list(string.ascii_letters)}
@@ -496,22 +555,51 @@ def fixup_by_dd(df, dd_name):
         sersuf_d['-1'] = '00'
         hrsersuf = hrsersuf.map(sersuf_d)  # 10x faster than replace
 
-        # TODO: log drops
-        hrhhid2 = (hrsample + hrsersuf + huhhnum).dropna()
+        hrhhid2 = hrsample + hrsersuf + huhhnum
+        to_drop = df[pd.isnull(hrhhid2)]
+        if to_drop.shape[1] > 0:
+            logger.info("Dropping {}".format(to_drop.index))
+
+        hrhhid2 = hrhhid2.dropna()
         df = df.copy()
         df['HRHHID2'] = hrhhid2.str.strip('.0').astype(np.int64)
         return df
 
+    @log_transform(dd_name)
     def year2_to_year4(df):
-        df['HRYEAR4'] = '19' + df.HRYEAR4.astype(str)
+        df['HRYEAR4'] = ('19' + df.HRYEAR4.astype(str)).astype(np.int64)
         return df
 
-    dispatch = {'cpsm1995-09': [compute_hrhhid2, year2_to_year4]
-                }
+    dispatch = {'cpsm1995-09': [compute_hrhhid2, year2_to_year4],
+                'cpsm1998-01': [compute_hrhhid2],
+                'cpsm2003-01': [compute_hrhhid2]
+               }
 
-    for func in dispatch[dd_name]:
+    for func in dispatch.get(dd_name, []):
         df = func(df)
     return df
+
+
+def log_transform(obj_name):
+    """
+    Log that the object `obj_name` is being transformed by the function being
+    decorated.
+    """
+    def decorate(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            logger.info("Transforming {} via {}".format(obj_name,
+                                                        func.__name__))
+            result = func(*args, **kwargs)
+            return result
+        return wrapper
+    return decorate
+
+# ----------------------------------------------------------------------------
+# Consistency checks
+check_width = lambda df: df['length'] == df['end'] - df['start'] + 1
+check_steps = lambda df: df.start - df.end.shift(1).fillna(0) - 1 == 0
+# ----------------------------------------------------------------------------
 
 # def align_lfsr(df, dd_name):
 #     """Jan1989 and Jan1999. LFSR (labor focrce status recode)

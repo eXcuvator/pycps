@@ -10,6 +10,14 @@ import pandas.util.testing as tm
 import pycps.parsers as p
 from pycps.compat import StringIO
 
+curdir = os.path.dirname(__file__)
+
+def _skip_if_no_tables():
+    try:
+        import tables
+    except ImportError:
+        import nose
+        raise(nose.SkipTest("tables not installed"))
 
 class TestReaderSettings(unittest.TestCase):
 
@@ -30,7 +38,7 @@ These are reserved to substitue in other paths.
 }''')
 
     def test_maybe_open_str(self):
-        with p._open_file_or_stringio('files/maybe_open.txt') as f:
+        with p._open_file_or_stringio(curdir + '/files/maybe_open.txt') as f:
             result = f.readline()
 
         expected = "foobarbaz\n"
@@ -81,7 +89,7 @@ These are reserved to substitue in other paths.
 class TestDDParser(unittest.TestCase):
 
     def setUp(self):
-        self.testfile = Path('files/jan2007.ddf')  # TODO: filepath
+        self.testfile = Path(curdir + '/files/cpsm2007-01.ddf')
         settings = {'outpath': 'dds/',
                     'dd_path': 'tmp/',
                     'dd_store': 'baz.h5'}
@@ -113,7 +121,7 @@ class TestDDParser(unittest.TestCase):
         self.assertEqual(expected, regex.match(s).groups())
 
     def test_store_name_basic(self):
-        expected = 'jan2007'
+        expected = 'cpsm2007-01'
         self.assertEqual(expected, self.parser.store_name)
 
     def test_aug05_regex_basic(self):
@@ -244,6 +252,11 @@ class TestDDParser(unittest.TestCase):
             result = p._month_to_dd(month)
             self.assertEqual(result, dd)
 
+    def test_full_run(self):
+        result = self.parser.run()
+        expected = pd.read_csv(curdir + '/files/jan08expected.csv')
+        tm.assert_frame_equal(result, expected)
+
     def test_standardize_ids(self):
         # test '63' '63B', '65B', '63A'] for hrsample
         pass
@@ -251,6 +264,7 @@ class TestDDParser(unittest.TestCase):
 class testHDFStore(unittest.TestCase):
 
     def setUp(self):
+        _skip_if_no_tables()
         self.hdfpath = '_hdfstore_.h5'
         self.hdf = pd.HDFStore(self.hdfpath)
         self.dd =  pd.DataFrame([['HRHHID',15, 1, 15],
